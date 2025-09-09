@@ -10,8 +10,8 @@ import serial
 import serial.tools.list_ports
 
 from config import (
-    DEFAULT_BAUD, TARGET_HZ, DEFAULT_POLL_HZ, Y_LIMITS,
-    MAX_POINTS_PER_CHANNEL,   # optional safety cap
+    DEFAULT_BAUD, TARGET_HZ, Y_LIMITS,
+    MAX_POINTS_PER_CHANNEL, LINE_WIDTH, LINE_COLORS
 )
 from serial_reader import SerialReader
 
@@ -19,8 +19,8 @@ from serial_reader import SerialReader
 class MultiPlot(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Serial Streaming → PyQtGraph (polling '1')")
-        pg.setConfigOptions(antialias=False, useOpenGL=False)
+        self.setWindowTitle("Serial Streaming → PyQtGraph (request-on-receive)")
+        pg.setConfigOptions(antialias=False, useOpenGL=False, background='w')
 
         # --- Central plot ---
         central = QtWidgets.QWidget()
@@ -48,15 +48,6 @@ class MultiPlot(QtWidgets.QMainWindow):
         self.baud_combo = QtWidgets.QComboBox()
         self.connect_btn = QtWidgets.QPushButton("Connect")
 
-        # polling controls
-        self.poll_chk = QtWidgets.QCheckBox("Auto-send '1'")
-        self.poll_chk.setChecked(True)
-        self.poll_hz = QtWidgets.QDoubleSpinBox()
-        self.poll_hz.setDecimals(1)
-        self.poll_hz.setRange(0.1, 1000.0)
-        self.poll_hz.setSingleStep(0.5)
-        self.poll_hz.setValue(DEFAULT_POLL_HZ)
-
         for b in [9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600]:
             self.baud_combo.addItem(str(b))
         self.baud_combo.setCurrentText(str(DEFAULT_BAUD))
@@ -67,10 +58,6 @@ class MultiPlot(QtWidgets.QMainWindow):
         h.addSpacing(12)
         h.addWidget(QtWidgets.QLabel("Baud:"))
         h.addWidget(self.baud_combo)
-        h.addSpacing(12)
-        h.addWidget(self.poll_chk)
-        h.addWidget(QtWidgets.QLabel("Hz:"))
-        h.addWidget(self.poll_hz)
         h.addSpacing(12)
         h.addWidget(self.connect_btn)
         vbox.insertWidget(0, ctrl)  # top
@@ -83,27 +70,19 @@ class MultiPlot(QtWidgets.QMainWindow):
         self.connected = False
         self.paused = False
 
-        self.curves = []
+        self.curves: List[pg.PlotDataItem] = []
         self.num_ch: Optional[int] = None
         self.buffers: List[deque] = []
 
-        self._samples_seen = 0
-        self._t0 = time.perf_counter()
-        self._estimated_hz: Optional[float] = None
-
-        # Flicker-reduction: throttle X-range changes and debounce Y bumps
-        self._last_x_extend_len = 0
-        self._x_extend_step = 1     # extend the x-view every N new points
+        # Flicker-reduction: debounce Y bumps
         self._last_y_top = self.y_limit[1]
-        self._y_bump_margin = 0.05    # bump y-top if >5% higher than current top
+        self._y_bump_margin = 0.05    # bump y-top if >5% above current top
         self._y_update_ms = 200       # y-top can update at most 5x/sec
         self._last_y_update_t = 0.0
 
         # --- Signals ---
         self.refresh_btn.clicked.connect(self.populate_ports)
         self.connect_btn.clicked.connect(self.toggle_connection)
-        self.poll_chk.toggled.connect(self._apply_poll_settings)
-        self.poll_hz.valueChanged.connect(self._apply_poll_settings)
 
         QtWidgets.QShortcut(QtCore.Qt.Key_P, self, activated=self._toggle_pause)
         QtWidgets.QShortcut(QtCore.Qt.Key_C, self, activated=self._clear_buffers)
@@ -144,12 +123,7 @@ class MultiPlot(QtWidgets.QMainWindow):
 
     def start_reader(self, device, baud):
         self.reset_plot_buffers()
-        self.reader = SerialReader(
-            device,
-            baud,
-            poll_enabled=self.poll_chk.isChecked(),
-            poll_hz=float(self.poll_hz.value()),
-        )
+        self.reader = SerialReader(device, baud)  # request-on-receive only
         self.reader.sample.connect(self._on_sample)
         self.reader.status.connect(self._on_status)
         self.reader.connected.connect(self._on_connected)
@@ -163,6 +137,7 @@ class MultiPlot(QtWidgets.QMainWindow):
             self.reader.wait(1000)
         self.reader = None
         self.connected = False
+        pg.setConfigOptions(antialias=True)  # pretty when idle
         self.connect_btn.setText("Connect")
         self.connect_btn.setEnabled(True)
         self.enable_controls(True)
@@ -172,13 +147,6 @@ class MultiPlot(QtWidgets.QMainWindow):
         self.port_combo.setEnabled(enable)
         self.refresh_btn.setEnabled(enable)
         self.baud_combo.setEnabled(enable)
-        self.poll_chk.setEnabled(enable)
-        self.poll_hz.setEnabled(enable)
-
-    # live-apply polling settings to the running reader
-    def _apply_poll_settings(self):
-        if self.reader and self.reader.isRunning():
-            self.reader.set_polling(self.poll_chk.isChecked(), float(self.poll_hz.value()))
 
     # ---------- Reader slots ----------
     def _on_status(self, msg: str):
@@ -186,14 +154,14 @@ class MultiPlot(QtWidgets.QMainWindow):
 
     def _on_connected(self):
         self.connected = True
+        pg.setConfigOptions(antialias=False)  # fast while streaming
         self.connect_btn.setText("Disconnect")
         self.connect_btn.setEnabled(True)
-        self.enable_controls(False)  # lock controls while connected
-        # make sure current polling UI is applied to the thread
-        self._apply_poll_settings()
+        self.enable_controls(False)
 
     def _on_disconnected(self):
         self.connected = False
+        pg.setConfigOptions(antialias=True)   # pretty when idle
         self.connect_btn.setText("Connect")
         self.connect_btn.setEnabled(True)
         self.enable_controls(True)
@@ -209,29 +177,23 @@ class MultiPlot(QtWidgets.QMainWindow):
             self.buffers = [deque() for _ in range(self.num_ch)]
 
             # Color palette (extend if needed)
-            colors = [
-                (255, 0, 0),     # red
-                (0, 200, 0),     # green
-                (0, 0, 255),     # blue
-                (200, 100, 0),   # orange
-                (200, 0, 200),   # magenta
-                (0, 200, 200),   # cyan
-                (150, 150, 150), # gray
-            ]
+            colors = list(LINE_COLORS)
+            if self.num_ch > len(colors):
+                import random
+                random.seed(1234)
+                while len(colors) < self.num_ch:
+                    colors.append(tuple(random.choices(range(256), k=3)))
 
             # Create one curve per channel with performance opts
             for i in range(self.num_ch):
                 name = f"ch{i+1}"
                 color = colors[i % len(colors)]
-                curve = self.plot.plot(pen=pg.mkPen(color=color, width=2), name=name)
-                curve.setClipToView(True)            # render only what's visible
-                curve.setDownsampling(auto=True)     # auto downsample for speed
+                curve = self.plot.plot(pen=pg.mkPen(color=color, width=LINE_WIDTH), name=name)
+                curve.setClipToView(True)
+                curve.setDownsampling(auto=True)
                 self.curves.append(curve)
 
             self._on_status(f"Detected {self.num_ch} channel(s)")
-            self._samples_seen = 0
-            self._t0 = time.perf_counter()
-            self._estimated_hz = None
 
         # Append new values (full history)
         n = min(self.num_ch, vals.size)
@@ -245,13 +207,6 @@ class MultiPlot(QtWidgets.QMainWindow):
                 if extra > 0:
                     for _ in range(extra):
                         self.buffers[i].popleft()
-
-        # Keep an estimate of input rate for the status bar
-        self._samples_seen += 1
-        if self._samples_seen % 50 == 0:
-            dt = time.perf_counter() - self._t0
-            if dt > 0.2:
-                self._estimated_hz = self._samples_seen / dt
 
     def _redraw(self):
         if not self.buffers:
@@ -280,13 +235,7 @@ class MultiPlot(QtWidgets.QMainWindow):
             y_plot = y[::decim] if decim > 1 else y
             curve.setData(x_plot, y_plot)
 
-        # ---- Throttle x-range updates (reduce label flicker) ----
-        if length - self._last_x_extend_len >= self._x_extend_step:
-            self.plot.getViewBox().enableAutoRange(axis='x', enable=False)
-            self.plot.setXRange(0, max(1, length - 1), padding=0)
-            self._last_x_extend_len = length
-
-        # ---- Debounce y-range bumps (only when meaningfully higher) ----
+        # ---- Debounce y-range bumps ----
         if any(len(b) for b in self.buffers):
             max_val = max((max(b) for b in self.buffers if len(b) > 0), default=0.0)
         else:
@@ -301,22 +250,21 @@ class MultiPlot(QtWidgets.QMainWindow):
             self._last_y_update_t = now
 
         # ---- Status bar ----
-        if self._estimated_hz:
-            self.sb.showMessage(
-                f"{'Connected' if self.connected else 'Idle'} | "
-                f"{self.num_ch or 0} ch | ~{self._estimated_hz:.1f} Hz | "
-                f"{length} samples | P=Pause, C=Clear"
-            )
+        self.sb.showMessage(
+            f"{'Connected' if self.connected else 'Idle'} | "
+            f"{self.num_ch or 0} ch | {length} samples | P=Pause, C=Clear"
+        )
 
     # ---------- Helpers ----------
     def _toggle_pause(self):
         self.paused = not self.paused
+        pg.setConfigOptions(antialias=self.paused)
+        self.plot.repaint()
         self.sb.showMessage("Paused" if self.paused else "Resumed", 2000)
 
     def _clear_buffers(self):
         for dq in self.buffers:
             dq.clear()
-        self._last_x_extend_len = 0
         self._last_y_top = self.y_limit[1]
         self._last_y_update_t = 0.0
         self.sb.showMessage("Cleared buffers", 2000)
@@ -327,10 +275,6 @@ class MultiPlot(QtWidgets.QMainWindow):
         self.curves = []
         self.buffers = []
         self.num_ch = None
-        self._samples_seen = 0
-        self._t0 = time.perf_counter()
-        self._estimated_hz = None
-        self._last_x_extend_len = 0
         self._last_y_top = self.y_limit[1]
         self._last_y_update_t = 0.0
 
