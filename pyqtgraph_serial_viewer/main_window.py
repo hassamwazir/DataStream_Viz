@@ -1,7 +1,12 @@
 # main_window.py
 import time
+import queue
 from collections import deque
+from logger import CsvWriter
 from typing import List, Optional
+
+from ring import Ring2D
+import numpy as np
 
 import numpy as np
 from PyQt5 import QtWidgets, QtCore
@@ -21,6 +26,10 @@ class MultiPlot(QtWidgets.QMainWindow):
         super().__init__()
         self.setWindowTitle("Serial Streaming → PyQtGraph (request-on-receive)")
         pg.setConfigOptions(antialias=False, useOpenGL=False, background='w')
+
+        # --- Logging ---
+        self.log_q = queue.Queue(maxsize=10_000) # buffer up to 10k rows
+        self.logger = None  # created on connect when we know channel count
 
         # --- Central plot ---
         central = QtWidgets.QWidget()
@@ -64,6 +73,8 @@ class MultiPlot(QtWidgets.QMainWindow):
 
         # --- Status bar ---
         self.sb = self.statusBar()
+        self._last_status_t = 0.0
+        self._status_every = 0.25  # update the status bar at ~4 Hz
 
         # --- Runtime state (full history only) ---
         self.reader: Optional[SerialReader] = None
@@ -72,7 +83,7 @@ class MultiPlot(QtWidgets.QMainWindow):
 
         self.curves: List[pg.PlotDataItem] = []
         self.num_ch: Optional[int] = None
-        self.buffers: List[deque] = []
+        self.ring = None
 
         # Flicker-reduction: debounce Y bumps
         self._last_y_top = self.y_limit[1]
@@ -123,21 +134,28 @@ class MultiPlot(QtWidgets.QMainWindow):
 
     def start_reader(self, device, baud):
         self.reset_plot_buffers()
-        self.reader = SerialReader(device, baud)  # request-on-receive only
+        self.reader = SerialReader(device, baud)
         self.reader.sample.connect(self._on_sample)
         self.reader.status.connect(self._on_status)
         self.reader.connected.connect(self._on_connected)
         self.reader.disconnected.connect(self._on_disconnected)
         self.reader.start()
-        self.connect_btn.setEnabled(False)  # will re-enable once connected
+        self.connect_btn.setEnabled(False)
 
     def stop_reader(self):
         if self.reader and self.reader.isRunning():
             self.reader.stop()
             self.reader.wait(1000)
         self.reader = None
+
+        # stop logger last
+        if self.logger:
+            self.logger.stop()
+            self.logger.join(timeout=1.0)
+            self.logger = None
+
         self.connected = False
-        pg.setConfigOptions(antialias=True)  # pretty when idle
+        pg.setConfigOptions(antialias=True)
         self.connect_btn.setText("Connect")
         self.connect_btn.setEnabled(True)
         self.enable_controls(True)
@@ -172,9 +190,10 @@ class MultiPlot(QtWidgets.QMainWindow):
             return
 
         if self.num_ch is None:
-            # First packet: set up channel count and full-history buffers
             self.num_ch = int(vals.size)
-            self.buffers = [deque() for _ in range(self.num_ch)]
+            # Allocate ring with your existing cap (72_000)
+            cap = MAX_POINTS_PER_CHANNEL or 72_000
+            self.ring = Ring2D(self.num_ch, cap, dtype=np.float32)
 
             # Color palette (extend if needed)
             colors = list(LINE_COLORS)
@@ -190,35 +209,44 @@ class MultiPlot(QtWidgets.QMainWindow):
                 color = colors[i % len(colors)]
                 curve = self.plot.plot(pen=pg.mkPen(color=color, width=LINE_WIDTH), name=name)
                 curve.setClipToView(True)
-                curve.setDownsampling(auto=True)
+                # Version-safe downsampling:
+                try:
+                    curve.setDownsampling(method="peak")   # newer pyqtgraph
+                except TypeError:
+                    try:
+                        curve.setDownsampling(mode="peak") # some versions
+                    except TypeError:
+                        curve.setDownsampling(auto=True)   # oldest fallback
                 self.curves.append(curve)
 
             self._on_status(f"Detected {self.num_ch} channel(s)")
 
-        # Append new values (full history)
+            # Start CSV logger now that we know channel count
+            header = ["timestamp"] + [f"ch{i+1}" for i in range(self.num_ch)]
+            self.logger = CsvWriter(self.log_q, rotate_minutes=60, header=header)
+            self.logger.start()
+
+        # Append new values (full history for plotting)
         n = min(self.num_ch, vals.size)
         for i in range(n):
             self.buffers[i].append(vals[i])
 
-        # Optional safety cap for memory
-        if MAX_POINTS_PER_CHANNEL:
-            for i in range(self.num_ch):
-                extra = len(self.buffers[i]) - MAX_POINTS_PER_CHANNEL
-                if extra > 0:
-                    for _ in range(extra):
-                        self.buffers[i].popleft()
+        # Enqueue for logging (lossless capture)
+        try:
+            self.log_q.put_nowait((time.time(), *vals[:n].tolist()))
+        except queue.Full:
+            # Optional: keep a drop counter and show an occasional warning
+            pass
 
     def _redraw(self):
-        if not self.buffers:
-            return
-        length = max((len(b) for b in self.buffers), default=0)
-        if length == 0:
+        if not self.ring or self.ring.n == 0:
             return
 
-        # Build x once per frame
+        Y = self.ring.as_2d()          # shape: (C, n), chronological
+        length = Y.shape[1]
         x = np.arange(length)
 
-        # Optional coarse decimation for huge histories (on top of pg's downsampling)
+        # Optional coarse decimation (rarely needed at 72k, but keep your logic)
         decim = 1
         if length > 500_000:
             decim = 16
@@ -226,21 +254,16 @@ class MultiPlot(QtWidgets.QMainWindow):
             decim = 8
         elif length > 100_000:
             decim = 4
-
         x_plot = x[::decim] if decim > 1 else x
 
-        # Update curves
+        # Update curves (no allocations besides slicing)
         for i, curve in enumerate(self.curves):
-            y = np.fromiter(self.buffers[i], dtype=float, count=length)
+            y = Y[i]
             y_plot = y[::decim] if decim > 1 else y
             curve.setData(x_plot, y_plot)
 
-        # ---- Debounce y-range bumps ----
-        if any(len(b) for b in self.buffers):
-            max_val = max((max(b) for b in self.buffers if len(b) > 0), default=0.0)
-        else:
-            max_val = 0.0
-
+        # Debounced y-range bump using the array directly
+        max_val = float(Y.max()) if length else 0.0
         now = time.perf_counter()
         need_bump = max_val > (self._last_y_top * (1 + self._y_bump_margin))
         if need_bump and (now - self._last_y_update_t) >= (self._y_update_ms / 1000.0):
@@ -249,11 +272,13 @@ class MultiPlot(QtWidgets.QMainWindow):
             self.plot.setYRange(self.y_limit[0], self._last_y_top, padding=0)
             self._last_y_update_t = now
 
-        # ---- Status bar ----
-        self.sb.showMessage(
-            f"{'Connected' if self.connected else 'Idle'} | "
-            f"{self.num_ch or 0} ch | {length} samples | P=Pause, C=Clear"
-        )
+        # ---- Status bar (throttled) ----
+        if (now - self._last_status_t) >= self._status_every:
+            self._last_status_t = now
+            self.sb.showMessage(
+                f"{'Connected' if self.connected else 'Idle'} | "
+                f"{self.num_ch or 0} ch | {length} samples | P=Pause, C=Clear"
+            )
 
     # ---------- Helpers ----------
     def _toggle_pause(self):
@@ -263,8 +288,9 @@ class MultiPlot(QtWidgets.QMainWindow):
         self.sb.showMessage("Paused" if self.paused else "Resumed", 2000)
 
     def _clear_buffers(self):
-        for dq in self.buffers:
-            dq.clear()
+        if self.ring:
+            # Just re-init the ring with same shape
+            self.ring = Ring2D(self.num_ch, self.ring.N, dtype=np.float32)
         self._last_y_top = self.y_limit[1]
         self._last_y_update_t = 0.0
         self.sb.showMessage("Cleared buffers", 2000)
@@ -273,7 +299,7 @@ class MultiPlot(QtWidgets.QMainWindow):
         self.plot.clear()
         self.plot.addLegend()
         self.curves = []
-        self.buffers = []
+        self.ring = None
         self.num_ch = None
         self._last_y_top = self.y_limit[1]
         self._last_y_update_t = 0.0
@@ -283,6 +309,14 @@ class MultiPlot(QtWidgets.QMainWindow):
             if self.reader and self.reader.isRunning():
                 self.reader.stop()
                 self.reader.wait(1000)
+        except Exception:
+            pass
+        # Ensure logger is stopped even if window closed without pressing "Disconnect"
+        try:
+            if self.logger:
+                self.logger.stop()
+                self.logger.join(timeout=1.0)
+                self.logger = None
         except Exception:
             pass
         return super().closeEvent(event)

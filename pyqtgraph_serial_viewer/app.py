@@ -7,7 +7,7 @@ def main():
     win = MultiPlot()
     win.resize(1100, 650)
     win.show()
-    sys.exit(app.exec_())
+    sys.exit(app.exec())
 
 if __name__ == "__main__":
     main()
