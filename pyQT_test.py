@@ -4,8 +4,8 @@ import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore
 
 app = pg.mkQApp("Plotting Example")
-#mw = QtWidgets.QMainWindow()
-#mw.resize(800,800)
+# mw = QtWidgets.QMainWindow()
+# mw.resize(800,800)
 
 win = pg.GraphicsLayoutWidget(show=True, title="Basic plotting examples")
 win.resize(1000,600)

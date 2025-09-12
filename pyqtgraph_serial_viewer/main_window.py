@@ -1,15 +1,14 @@
 # main_window.py
 import time
 import queue
-from collections import deque
 from logger import CsvWriter
 from typing import List, Optional
 
 from ring import Ring2D
 import numpy as np
 
-import numpy as np
-from PyQt5 import QtWidgets, QtCore
+from PyQt5 import QtWidgets, QtCore, QtGui
+
 import pyqtgraph as pg
 import serial
 import serial.tools.list_ports
@@ -28,8 +27,11 @@ class MultiPlot(QtWidgets.QMainWindow):
         pg.setConfigOptions(antialias=False, useOpenGL=False, background='w')
 
         # --- Logging ---
-        self.log_q = queue.Queue(maxsize=10_000) # buffer up to 10k rows
+        self.log_q = queue.Queue(maxsize=10_000)  # buffer up to 10k rows
         self.logger = None  # created on connect when we know channel count
+
+        # Time origin for elapsed-x axis
+        self.t0 = None
 
         # --- Central plot ---
         central = QtWidgets.QWidget()
@@ -42,10 +44,44 @@ class MultiPlot(QtWidgets.QMainWindow):
         self.plot = pg.PlotWidget()
         self.plot.showGrid(x=True, y=True, alpha=0.25)
         self.plot.addLegend()
-        self.plot.setLabel("bottom", "Sample")
+        self.plot.setLabel("bottom", "Elapsed (s)")
         self.plot.setLabel("left", "Value")
         self.plot.setYRange(*self.y_limit)
         vbox.addWidget(self.plot, 1)
+
+        # Click-to-select: scatter that renders all picked points
+        self.pick_marker = pg.ScatterPlotItem(
+            size=10,
+            pen=pg.mkPen('k', width=1),
+            brush=pg.mkBrush(255, 0, 0, 180),
+        )
+        self.pick_marker.setZValue(10)
+        self.plot.addItem(self.pick_marker)
+
+        # Store selected points; each entry: {"x": float, "y": float, "ch": int, "label": TextItem}
+        self.picks: List[dict] = []
+
+        # Reusable label styling + factory
+        self._label_font = QtGui.QFont()
+        self._label_font.setPointSize(12)
+        self._label_font.setBold(True)
+
+        def _make_pick_label(text: str) -> pg.TextItem:
+            ti = pg.TextItem(text, anchor=(0, 1))  # bottom-left anchored at point
+            ti.setZValue(11)
+            ti.setFont(self._label_font)
+            ti.setColor(pg.mkColor(0, 0, 0))
+            try:
+                ti.setFill(pg.mkBrush(255, 255, 255, 230))   # mostly opaque background
+                ti.setBorder(pg.mkPen(0, 0, 0, 200))         # thin black border
+            except Exception:
+                pass
+            return ti
+
+        self._make_pick_label = _make_pick_label  # keep factory on the instance
+
+        # Mouse click handler on the plot (uses toggle logic in _on_plot_click)
+        self.plot.scene().sigMouseClicked.connect(self._on_plot_click)
 
         # --- Top control bar ---
         ctrl = QtWidgets.QWidget()
@@ -76,7 +112,7 @@ class MultiPlot(QtWidgets.QMainWindow):
         self._last_status_t = 0.0
         self._status_every = 0.25  # update the status bar at ~4 Hz
 
-        # --- Runtime state (full history only) ---
+        # --- Runtime state ---
         self.reader: Optional[SerialReader] = None
         self.connected = False
         self.paused = False
@@ -105,6 +141,8 @@ class MultiPlot(QtWidgets.QMainWindow):
 
         # Initial port scan
         self.populate_ports()
+
+
 
     # ---------- Controls ----------
     def populate_ports(self):
@@ -191,7 +229,6 @@ class MultiPlot(QtWidgets.QMainWindow):
 
         if self.num_ch is None:
             self.num_ch = int(vals.size)
-            # Allocate ring with your existing cap (72_000)
             cap = MAX_POINTS_PER_CHANNEL or 72_000
             self.ring = Ring2D(self.num_ch, cap, dtype=np.float32)
 
@@ -203,20 +240,19 @@ class MultiPlot(QtWidgets.QMainWindow):
                 while len(colors) < self.num_ch:
                     colors.append(tuple(random.choices(range(256), k=3)))
 
-            # Create one curve per channel with performance opts
+            # One curve per channel + version-safe downsampling
             for i in range(self.num_ch):
                 name = f"ch{i+1}"
                 color = colors[i % len(colors)]
                 curve = self.plot.plot(pen=pg.mkPen(color=color, width=LINE_WIDTH), name=name)
                 curve.setClipToView(True)
-                # Version-safe downsampling:
                 try:
-                    curve.setDownsampling(method="peak")   # newer pyqtgraph
+                    curve.setDownsampling(method="peak")    # newer pyqtgraph
                 except TypeError:
                     try:
-                        curve.setDownsampling(mode="peak") # some versions
+                        curve.setDownsampling(mode="peak")  # some versions
                     except TypeError:
-                        curve.setDownsampling(auto=True)   # oldest fallback
+                        curve.setDownsampling(auto=True)    # oldest fallback
                 self.curves.append(curve)
 
             self._on_status(f"Detected {self.num_ch} channel(s)")
@@ -226,27 +262,36 @@ class MultiPlot(QtWidgets.QMainWindow):
             self.logger = CsvWriter(self.log_q, rotate_minutes=60, header=header)
             self.logger.start()
 
-        # Append new values (full history for plotting)
+        # Append new values with a timestamp and log using the SAME timestamp
         n = min(self.num_ch, vals.size)
-        for i in range(n):
-            self.buffers[i].append(vals[i])
+        t = time.time()
+        if getattr(self, "t0", None) is None:
+            self.t0 = t  # first-sample origin for elapsed-time x-axis
 
-        # Enqueue for logging (lossless capture)
+        self.ring.append(vals[:n], t=t)
+
+        # Enqueue for logging
         try:
-            self.log_q.put_nowait((time.time(), *vals[:n].tolist()))
+            self.log_q.put_nowait((t, *vals[:n].tolist()))
         except queue.Full:
-            # Optional: keep a drop counter and show an occasional warning
+            # Optional: track drops if you care
             pass
 
+
     def _redraw(self):
-        if not self.ring or self.ring.n == 0:
+        # Need data and a time origin
+        if not self.ring or self.ring.n == 0 or getattr(self, "t0", None) is None:
             return
 
-        Y = self.ring.as_2d()          # shape: (C, n), chronological
+        t, Y = self.ring.view()   # t: (n,), Y: (C, n) in chronological order
         length = Y.shape[1]
-        x = np.arange(length)
+        if length == 0:
+            return
 
-        # Optional coarse decimation (rarely needed at 72k, but keep your logic)
+        # Elapsed seconds since start
+        x = t - self.t0
+
+        # Optional coarse decimation on very large histories
         decim = 1
         if length > 500_000:
             decim = 16
@@ -254,15 +299,16 @@ class MultiPlot(QtWidgets.QMainWindow):
             decim = 8
         elif length > 100_000:
             decim = 4
+
         x_plot = x[::decim] if decim > 1 else x
 
-        # Update curves (no allocations besides slicing)
+        # Update curves
         for i, curve in enumerate(self.curves):
             y = Y[i]
             y_plot = y[::decim] if decim > 1 else y
             curve.setData(x_plot, y_plot)
 
-        # Debounced y-range bump using the array directly
+        # Debounced y-range bump (preserve current bottom, expand top as needed)
         max_val = float(Y.max()) if length else 0.0
         now = time.perf_counter()
         need_bump = max_val > (self._last_y_top * (1 + self._y_bump_margin))
@@ -272,13 +318,14 @@ class MultiPlot(QtWidgets.QMainWindow):
             self.plot.setYRange(self.y_limit[0], self._last_y_top, padding=0)
             self._last_y_update_t = now
 
-        # ---- Status bar (throttled) ----
+        # Status bar (throttled)
         if (now - self._last_status_t) >= self._status_every:
             self._last_status_t = now
             self.sb.showMessage(
                 f"{'Connected' if self.connected else 'Idle'} | "
                 f"{self.num_ch or 0} ch | {length} samples | P=Pause, C=Clear"
             )
+
 
     # ---------- Helpers ----------
     def _toggle_pause(self):
@@ -288,21 +335,71 @@ class MultiPlot(QtWidgets.QMainWindow):
         self.sb.showMessage("Paused" if self.paused else "Resumed", 2000)
 
     def _clear_buffers(self):
+        # 1) Clear selected markers & labels
+        # -- multi-label version --
+        if hasattr(self, "picks") and self.picks:
+            for p in self.picks:
+                lbl = p.get("label")
+                if lbl is not None:
+                    try:
+                        self.plot.removeItem(lbl)
+                    except Exception:
+                        pass
+            self.picks.clear()
+
+        # -- single-label fallback (if you still have it) --
+        if hasattr(self, "pick_label") and self.pick_label is not None:
+            try:
+                self.pick_label.setText("")
+            except Exception:
+                pass
+
+        # Clear the scatter points
+        if hasattr(self, "pick_marker") and self.pick_marker is not None:
+            try:
+                self.pick_marker.setData(x=[], y=[])
+            except Exception:
+                pass
+
+        # 2) Reset the data buffers and time origin
         if self.ring:
-            # Just re-init the ring with same shape
             self.ring = Ring2D(self.num_ch, self.ring.N, dtype=np.float32)
+        self.t0 = None
+
+        # 3) Reset y-range bump state
         self._last_y_top = self.y_limit[1]
         self._last_y_update_t = 0.0
-        self.sb.showMessage("Cleared buffers", 2000)
+
+        # 4) Status
+        self.sb.showMessage("Cleared buffers & picks", 2000)
+
 
     def reset_plot_buffers(self):
+        # remove existing labels from the scene
+        for p in getattr(self, "picks", []):
+            if p.get("label"):
+                try:
+                    self.plot.removeItem(p["label"])
+                except Exception:
+                    pass
+
         self.plot.clear()
         self.plot.addLegend()
+
+        # re-add scatter after clear
+        try:
+            self.plot.addItem(self.pick_marker)
+        except Exception:
+            pass
+
+        self.picks.clear()
         self.curves = []
         self.ring = None
         self.num_ch = None
+        self.t0 = None
         self._last_y_top = self.y_limit[1]
         self._last_y_update_t = 0.0
+
 
     def closeEvent(self, event):
         try:
@@ -320,3 +417,103 @@ class MultiPlot(QtWidgets.QMainWindow):
         except Exception:
             pass
         return super().closeEvent(event)
+    
+    def _on_plot_click(self, ev):
+        """Left: toggle nearest point (add/remove). Right: clear all picks."""
+        if not self.plot.sceneBoundingRect().contains(ev.scenePos()):
+            return
+
+        # Version-safe buttons (PyQt5/6)
+        if hasattr(QtCore.Qt, "MouseButton"):
+            LEFT = QtCore.Qt.MouseButton.LeftButton
+            RIGHT = QtCore.Qt.MouseButton.RightButton
+        else:
+            LEFT = QtCore.Qt.LeftButton
+            RIGHT = QtCore.Qt.RightButton
+
+        # Clear all picks on right-click
+        if ev.button() == RIGHT:
+            # remove labels from scene
+            for p in self.picks:
+                if p.get("label"):
+                    try:
+                        self.plot.removeItem(p["label"])
+                    except Exception:
+                        pass
+            self.picks.clear()
+            self._update_picks()
+            return
+
+        if ev.button() != LEFT:
+            return
+        if not self.ring or self.ring.n == 0 or getattr(self, "t0", None) is None:
+            return
+
+        # Map click to data coords
+        mouse_pt = self.plot.plotItem.vb.mapSceneToView(ev.scenePos())
+        x_click = float(mouse_pt.x())   # elapsed seconds
+        y_click = float(mouse_pt.y())
+
+        # Snap to nearest sample in time, then nearest channel by Y
+        t_abs, Y = self.ring.view()     # t_abs: (n,), Y: (C, n)
+        x = t_abs - self.t0
+        n = x.size
+        if n == 0:
+            return
+
+        idx = int(np.searchsorted(x, x_click))
+        if idx <= 0:
+            i_near = 0
+        elif idx >= n:
+            i_near = n - 1
+        else:
+            i_near = idx - 1 if (x_click - x[idx - 1]) <= (x[idx] - x_click) else idx
+
+        y_at = Y[:, i_near]
+        ch = int(np.argmin(np.abs(y_at - y_click)))
+        x_sel = float(x[i_near])
+        y_sel = float(y_at[ch])
+
+        # Toggle: if a pick already near this (x_sel,y_sel), remove it
+        dt_tol = 0.02  # 20 ms
+        dy_tol = (self.y_limit[1] - self.y_limit[0]) * 0.02  # 2% of Y range
+
+        for k, p in enumerate(self.picks):
+            if abs(p["x"] - x_sel) <= dt_tol and abs(p["y"] - y_sel) <= dy_tol and p["ch"] == ch:
+                # remove label from scene
+                if p.get("label"):
+                    try:
+                        self.plot.removeItem(p["label"])
+                    except Exception:
+                        pass
+                del self.picks[k]
+                self._update_picks()
+                ev.accept()
+                return
+
+        # Otherwise add a new pick + its own label
+        label = self._make_pick_label(f"t={x_sel:.3f}s  ch{ch+1}={y_sel:.6g}")
+        label.setPos(x_sel, y_sel)
+        self.plot.addItem(label)
+
+        self.picks.append({"x": x_sel, "y": y_sel, "ch": ch, "label": label})
+        self._update_picks()
+        ev.accept()
+
+
+
+    def _update_picks(self):
+        if self.picks:
+            xs = [p["x"] for p in self.picks]
+            ys = [p["y"] for p in self.picks]
+            self.pick_marker.setData(x=xs, y=ys)
+        else:
+            self.pick_marker.setData(x=[], y=[])
+
+    def _update_picks(self):
+        if self.picks:
+            xs = [p["x"] for p in self.picks]
+            ys = [p["y"] for p in self.picks]
+            self.pick_marker.setData(x=xs, y=ys)
+        else:
+            self.pick_marker.setData(x=[], y=[])
