@@ -6,7 +6,7 @@ Y_LIMITS = (-0.1, 1.0)   # default y-axis limits. Max Y will auto-expand if need
 # optional safety caps for full-history mode (purely defensive)
 MAX_POINTS_PER_CHANNEL = 72_000  # set None to disable
 
-
+TAIL_WINDOW_S = 30.0
 # ---------------- Plot Options ----------------
 LINE_WIDTH = 2
 LINE_COLORS = [
