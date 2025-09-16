@@ -1,10 +1,7 @@
 # ------------------ Defaults ------------------
 DEFAULT_BAUD = 115200
 TARGET_HZ = 50           # UI refresh Hz (not serial rate)
-Y_LIMITS = (-0.5, 1.0)   # default y-axis limits. Max Y will auto-expand if needed
-# ------------------------------------------------
-# plotting history mode
-FULL_HISTORY = False  # True = show everything; False = rolling window
+Y_LIMITS = (-0.1, 1.0)   # default y-axis limits. Max Y will auto-expand if needed
 
 # optional safety caps for full-history mode (purely defensive)
 MAX_POINTS_PER_CHANNEL = 72_000  # set None to disable

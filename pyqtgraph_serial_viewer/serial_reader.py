@@ -3,7 +3,8 @@ import time
 from typing import Optional
 import numpy as np
 import serial
-from PyQt5 import QtCore
+# from PyQt5.QtCore import pyqtSignal, QThread, QObject
+from PySide6.QtCore import Signal, QThread, QObject
 
 # ---- Tunables ----
 REQUEST_BYTE = b"1"        # change to b"1\n" or b"1\r\n" if your device expects newline/CR
@@ -12,19 +13,24 @@ REQUEST_MAX_RETRIES = 3    # retries before a short backoff
 REQUEST_BACKOFF_S = 0.500  # pause after hitting max retries
 
 
-class SerialReader(QtCore.QThread):
+class SerialReader(QThread):
     """
     Reads newline-delimited, space-separated numeric samples from a serial port.
     - Sends one request byte per sample ("request-on-receive").
     - Emits a numpy array for each complete, parsed line.
     - Has a watchdog to recover from dropped/missing responses.
     """
-    sample = QtCore.pyqtSignal(np.ndarray)
-    status = QtCore.pyqtSignal(str)
-    connected = QtCore.pyqtSignal()
-    disconnected = QtCore.pyqtSignal()
+    # sample = pyqtSignal(np.ndarray)
+    # status = pyqtSignal(str)
+    # connected = pyqtSignal()
+    # disconnected = pyqtSignal()
 
-    def __init__(self, port: str, baud: int, parent: Optional[QtCore.QObject] = None):
+    sample = Signal(np.ndarray)
+    status = Signal(str)
+    connected = Signal()
+    disconnected = Signal()
+
+    def __init__(self, port: str, baud: int, parent: Optional[QObject] = None):
         super().__init__(parent)
         self.port_name = port
         self.baud = baud

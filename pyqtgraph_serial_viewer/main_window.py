@@ -7,7 +7,8 @@ from typing import List, Optional
 from ring import Ring2D
 import numpy as np
 
-from PyQt5 import QtWidgets, QtCore, QtGui
+# from PyQt5 import QtWidgets, QtCore, QtGui
+from PySide6 import QtWidgets, QtCore, QtGui
 
 import pyqtgraph as pg
 import serial
@@ -40,6 +41,14 @@ class MultiPlot(QtWidgets.QMainWindow):
         self.setCentralWidget(central)
 
         self.y_limit = Y_LIMITS
+
+                # ---- Runtime-configurable copies of config.py values ----
+        self.default_baud = DEFAULT_BAUD
+        self.target_hz = TARGET_HZ
+        self.y_limit = list(Y_LIMITS)  # mutable
+        self.max_points_per_channel = MAX_POINTS_PER_CHANNEL
+        self.line_width = LINE_WIDTH
+        self.line_colors = list(LINE_COLORS)
 
         self.plot = pg.PlotWidget()
         self.plot.showGrid(x=True, y=True, alpha=0.25)
@@ -95,7 +104,7 @@ class MultiPlot(QtWidgets.QMainWindow):
 
         for b in [9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600]:
             self.baud_combo.addItem(str(b))
-        self.baud_combo.setCurrentText(str(DEFAULT_BAUD))
+        self.baud_combo.setCurrentText(str(self.default_baud))
 
         h.addWidget(QtWidgets.QLabel("Port:"))
         h.addWidget(self.port_combo, 2)
@@ -131,16 +140,39 @@ class MultiPlot(QtWidgets.QMainWindow):
         self.refresh_btn.clicked.connect(self.populate_ports)
         self.connect_btn.clicked.connect(self.toggle_connection)
 
-        QtWidgets.QShortcut(QtCore.Qt.Key_P, self, activated=self._toggle_pause)
-        QtWidgets.QShortcut(QtCore.Qt.Key_C, self, activated=self._clear_buffers)
+        QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_P), self, activated=self._toggle_pause)
+        QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_C), self, activated=self._clear_buffers)
+
+        # QtWidgets.QShortcut(QtCore.Qt.Key_P, self, activated=self._toggle_pause)
+        # QtWidgets.QShortcut(QtCore.Qt.Key_C, self, activated=self._clear_buffers)
 
         # --- Timer for UI redraws ---
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self._redraw)
-        self.timer.start(int(1000 / TARGET_HZ))
+        self.timer.start(int(1000 / self.target_hz))
 
         # Initial port scan
         self.populate_ports()
+
+        # --- File menu: Open CSV ---
+        file_menu = self.menuBar().addMenu("&File")
+
+        self.open_csv_act = QtGui.QAction("Open CSV…", self)
+        self.open_csv_act.setShortcut(QtGui.QKeySequence.Open)  # Ctrl/Cmd+O
+        self.open_csv_act.triggered.connect(self._open_csv_dialog)
+        file_menu.addAction(self.open_csv_act)
+
+        # --- Settings menu ---
+        settings_menu = self.menuBar().addMenu("&Settings")
+        self.settings_act = QtGui.QAction("Preferences…", self)
+        # Standard shortcut if available
+        try:
+            self.settings_act.setShortcut(QtGui.QKeySequence(QtGui.QKeySequence.StandardKey.Preferences))
+        except Exception:
+            self.settings_act.setShortcut(QtGui.QKeySequence("Ctrl+,"))
+        self.settings_act.triggered.connect(self._open_settings_dialog)
+        settings_menu.addAction(self.settings_act)
+
 
 
 
@@ -171,7 +203,8 @@ class MultiPlot(QtWidgets.QMainWindow):
             self.stop_reader()
 
     def start_reader(self, device, baud):
-        self.reset_plot_buffers()
+        # self.reset_plot_buffers()
+        self._clear_buffers()
         self.reader = SerialReader(device, baud)
         self.reader.sample.connect(self._on_sample)
         self.reader.status.connect(self._on_status)
@@ -229,11 +262,11 @@ class MultiPlot(QtWidgets.QMainWindow):
 
         if self.num_ch is None:
             self.num_ch = int(vals.size)
-            cap = MAX_POINTS_PER_CHANNEL or 72_000
+            cap = self.max_points_per_channel or 72_000
             self.ring = Ring2D(self.num_ch, cap, dtype=np.float32)
 
             # Color palette (extend if needed)
-            colors = list(LINE_COLORS)
+            colors = list(self.line_colors)
             if self.num_ch > len(colors):
                 import random
                 random.seed(1234)
@@ -244,7 +277,7 @@ class MultiPlot(QtWidgets.QMainWindow):
             for i in range(self.num_ch):
                 name = f"ch{i+1}"
                 color = colors[i % len(colors)]
-                curve = self.plot.plot(pen=pg.mkPen(color=color, width=LINE_WIDTH), name=name)
+                curve = self.plot.plot(pen=pg.mkPen(color=color, width=self.line_width), name=name)
                 curve.setClipToView(True)
                 try:
                     curve.setDownsampling(method="peak")    # newer pyqtgraph
@@ -492,7 +525,7 @@ class MultiPlot(QtWidgets.QMainWindow):
                 return
 
         # Otherwise add a new pick + its own label
-        label = self._make_pick_label(f"t={x_sel:.3f}s  ch{ch+1}={y_sel:.6g}")
+        label = self._make_pick_label(f"ch{ch+1}:{y_sel:.3f}\nt:{x_sel:.3f}s  ")
         label.setPos(x_sel, y_sel)
         self.plot.addItem(label)
 
@@ -517,3 +550,383 @@ class MultiPlot(QtWidgets.QMainWindow):
             self.pick_marker.setData(x=xs, y=ys)
         else:
             self.pick_marker.setData(x=[], y=[])
+
+
+    def _open_csv_dialog(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Open CSV",
+            "",
+            "CSV Files (*.csv);;All Files (*)"
+        )
+        if not path:
+            return
+        self.load_csv(path)
+
+    def load_csv(self, path: str):
+        """Load a CSV with header: timestamp,ch1,ch2,... and plot it."""
+        # If serial is running, stop it first so we’re not mixing live & file data
+        if self.reader and self.reader.isRunning():
+            self.stop_reader()
+
+        # Clear existing buffers/labels/markers
+        self._clear_buffers()
+
+        # Read header to count channels (and basic validation)
+        import csv
+        with open(path, "r", newline="") as f:
+            reader = csv.reader(f)
+            header = next(reader, None)
+        if not header or len(header) < 2 or header[0].strip().lower() != "timestamp":
+            self._on_status("CSV must start with header: timestamp,ch1,...")
+            return
+
+        num_ch = len(header) - 1
+
+        # Load data (fast path with numpy)
+        try:
+            data = np.loadtxt(path, delimiter=",", skiprows=1, dtype=float)
+        except Exception as e:
+            self._on_status(f"Failed to load CSV: {e}")
+            return
+
+        # Handle single-row CSV (loadtxt returns 1D in that case)
+        if data.ndim == 1:
+            data = data.reshape(1, -1)
+
+        if data.shape[1] != (1 + num_ch):
+            self._on_status("Column count mismatch between header and rows.")
+            return
+
+        t_abs = data[:, 0].astype(float)               # shape: (N,)
+        Y = data[:, 1:].astype(np.float32).T           # shape: (C, N)
+
+        # Ensure timestamps are strictly increasing for plotting
+        # (If not, we sort by time)
+        if not np.all(np.diff(t_abs) >= 0):
+            order = np.argsort(t_abs)
+            t_abs = t_abs[order]
+            Y = Y[:, order]
+
+        # Initialize curves if this is our first data
+        if self.num_ch is None:
+            self.num_ch = num_ch
+            cap = max(Y.shape[1], MAX_POINTS_PER_CHANNEL or 72_000)
+            self.ring = Ring2D(self.num_ch, cap, dtype=np.float32)
+
+            # Colors & curves (same logic you use on live connect)
+            colors = list(LINE_COLORS)
+            if self.num_ch > len(colors):
+                import random
+                random.seed(1234)
+                while len(colors) < self.num_ch:
+                    colors.append(tuple(random.choices(range(256), k=3)))
+            for i in range(self.num_ch):
+                name = f"ch{i+1}"
+                color = colors[i % len(colors)]
+                curve = self.plot.plot(pen=pg.mkPen(color=color, width=LINE_WIDTH), name=name)
+                curve.setClipToView(True)
+                try:
+                    curve.setDownsampling(method="peak")
+                except TypeError:
+                    try:
+                        curve.setDownsampling(mode="peak")
+                    except TypeError:
+                        curve.setDownsampling(auto=True)
+                self.curves.append(curve)
+        else:
+            # If curves already exist but count changed, rebuild
+            if self.num_ch != num_ch:
+                self.reset_plot_buffers()
+                self.num_ch = num_ch
+                cap = max(Y.shape[1], MAX_POINTS_PER_CHANNEL or 72_000)
+                self.ring = Ring2D(self.num_ch, cap, dtype=np.float32)
+
+                colors = list(LINE_COLORS)
+                if self.num_ch > len(colors):
+                    import random
+                    random.seed(1234)
+                    while len(colors) < self.num_ch:
+                        colors.append(tuple(random.choices(range(256), k=3)))
+                for i in range(self.num_ch):
+                    name = f"ch{i+1}"
+                    color = colors[i % len(colors)]
+                    curve = self.plot.plot(pen=pg.mkPen(color=color, width=LINE_WIDTH), name=name)
+                    curve.setClipToView(True)
+                    try:
+                        curve.setDownsampling(method="peak")
+                    except TypeError:
+                        try:
+                            curve.setDownsampling(mode="peak")
+                        except TypeError:
+                            curve.setDownsampling(auto=True)
+                    self.curves.append(curve)
+
+        # Feed the samples into the ring buffer
+        self.t0 = float(t_abs[0]) if t_abs.size else None
+        if self.t0 is None:
+            self._on_status("CSV file has no data rows.")
+            return
+
+        # Append sample-by-sample (Ring2D append API matches your live path)
+        # For very large files, this can take time; it’s simple & safe.
+        N = t_abs.shape[0]
+        for i in range(N):
+            self.ring.append(Y[:, i], t=float(t_abs[i]))
+
+        # Adjust Y range to data (respect your lower bound)
+        self._last_y_top = max(self.y_limit[1], float(np.nanmax(Y)) if Y.size else self.y_limit[1])
+        self.plot.enableAutoRange(axis='y', enable=False)
+        self.plot.setYRange(self.y_limit[0], self._last_y_top, padding=0)
+
+        # Refresh UI
+        self.connected = False
+        self.enable_controls(True)
+        self.connect_btn.setText("Connect")
+        self.sb.showMessage(f"Loaded CSV: {path} | {self.num_ch} ch | {N} samples", 5000)
+
+        # Trigger a draw now
+        self._redraw()
+
+
+    def _open_settings_dialog(self):
+        dlg = SettingsDialog(
+            parent=self,
+            default_baud=self.default_baud,
+            target_hz=self.target_hz,
+            y_min=float(self.y_limit[0]),
+            y_max=float(self.y_limit[1]),
+            max_points=self.max_points_per_channel,
+            line_width=self.line_width,
+            colors=self.line_colors,
+        )
+        if dlg.exec() == QtWidgets.QDialog.Accepted:
+            vals = dlg.values()
+
+            # 1) Baud default
+            self.default_baud = vals["default_baud"]
+            # Update dropdown default selection
+            self.baud_combo.setCurrentText(str(self.default_baud))
+
+            # 2) Refresh Hz
+            if vals["target_hz"] != self.target_hz and vals["target_hz"] > 0:
+                self.target_hz = vals["target_hz"]
+                self.timer.setInterval(int(1000 / self.target_hz))
+
+            # 3) Y limits
+            new_ymin, new_ymax = vals["y_limits"]
+            if new_ymin >= new_ymax:
+                self._on_status("Y min must be < Y max")
+            else:
+                self.y_limit = [new_ymin, new_ymax]
+                self._last_y_top = new_ymax  # reset bump baseline
+                self.plot.enableAutoRange(axis='y', enable=False)
+                self.plot.setYRange(new_ymin, new_ymax, padding=0)
+
+            # 4) Max points per channel (cap)
+            new_cap = vals["max_points_per_channel"]  # None or int
+            if new_cap != self.max_points_per_channel:
+                self.max_points_per_channel = new_cap
+                if self.ring and self.num_ch:
+                    # Rebuild ring with new capacity and keep as much data as possible
+                    t_old, Y_old = self.ring.view()
+                    keep = Y_old.shape[1]
+                    if new_cap is not None:
+                        keep = min(keep, int(new_cap))
+                    new_cap_final = new_cap or max(keep, 1)
+                    new_ring = Ring2D(self.num_ch, new_cap_final, dtype=np.float32)
+                    # Append the last 'keep' samples in chronological order
+                    if keep > 0:
+                        Y_keep = Y_old[:, -keep:] if keep < Y_old.shape[1] else Y_old
+                        t_keep = t_old[-keep:] if keep < t_old.shape[0] else t_old
+                        for i in range(t_keep.shape[0]):
+                            new_ring.append(Y_keep[:, i], t=float(t_keep[i]))
+                    self.ring = new_ring
+                    # Force a redraw on next tick
+                    self.t0 = t_old[0] if t_old.size else None
+
+            # 5) Line width
+            if vals["line_width"] != self.line_width:
+                self.line_width = vals["line_width"]
+                for i, curve in enumerate(self.curves):
+                    color = self.line_colors[i % len(self.line_colors)] if self.line_colors else (0, 0, 0)
+                    curve.setPen(pg.mkPen(color=color, width=self.line_width))
+
+            # 6) Line colors
+            new_colors = vals["line_colors"]
+            if new_colors and new_colors != self.line_colors:
+                self.line_colors = new_colors
+                # Extend palette if fewer than channels
+                colors = list(self.line_colors)
+                if self.num_ch and self.num_ch > len(colors):
+                    import random
+                    random.seed(1234)
+                    while len(colors) < self.num_ch:
+                        colors.append(tuple(random.choices(range(256), k=3)))
+                for i, curve in enumerate(self.curves):
+                    curve.setPen(pg.mkPen(color=colors[i % len(colors)], width=self.line_width))
+
+            self._on_status("Settings updated.")
+
+class SettingsDialog(QtWidgets.QDialog):
+    def __init__(self, parent=None, default_baud=115200, target_hz=50, y_min=-0.1, y_max=1.0,
+                 max_points=72_000, line_width=2, colors=None):
+        super().__init__(parent)
+        self.setWindowTitle("Preferences")
+        self.setModal(True)
+
+        if colors is None:
+            colors = []
+
+        layout = QtWidgets.QVBoxLayout(self)
+
+        form = QtWidgets.QFormLayout()
+        layout.addLayout(form)
+
+        # Default baud
+        self.baud_cb = QtWidgets.QComboBox()
+        self.baud_cb.setEditable(True)
+        for b in [9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600]:
+            self.baud_cb.addItem(str(b))
+        self.baud_cb.setCurrentText(str(default_baud))
+        form.addRow("Default baud:", self.baud_cb)
+
+        # Target Hz
+        self.hz_spin = QtWidgets.QSpinBox()
+        self.hz_spin.setRange(1, 240)
+        self.hz_spin.setValue(int(target_hz))
+        form.addRow("UI refresh (Hz):", self.hz_spin)
+
+        # Y limits
+        self.ymin_spin = QtWidgets.QDoubleSpinBox()
+        self.ymin_spin.setRange(-1e9, 1e9)
+        self.ymin_spin.setDecimals(6)
+        self.ymin_spin.setValue(float(y_min))
+        self.ymax_spin = QtWidgets.QDoubleSpinBox()
+        self.ymax_spin.setRange(-1e9, 1e9)
+        self.ymax_spin.setDecimals(6)
+        self.ymax_spin.setValue(float(y_max))
+        y_box = QtWidgets.QHBoxLayout()
+        y_box.addWidget(QtWidgets.QLabel("Min:"))
+        y_box.addWidget(self.ymin_spin)
+        y_box.addSpacing(12)
+        y_box.addWidget(QtWidgets.QLabel("Max:"))
+        y_box.addWidget(self.ymax_spin)
+        form.addRow("Y axis:", QtWidgets.QWidget())
+        form.itemAt(form.rowCount()-1, QtWidgets.QFormLayout.FieldRole).widget().setLayout(y_box)
+
+        # Max points per channel (0 = unlimited)
+        self.max_points_spin = QtWidgets.QSpinBox()
+        self.max_points_spin.setRange(0, 5_000_000)
+        self.max_points_spin.setValue(int(max_points or 0))
+        form.addRow("Max points / channel (0 = unlimited):", self.max_points_spin)
+
+        # Line width
+        self.width_spin = QtWidgets.QDoubleSpinBox()
+        self.width_spin.setRange(0.5, 10.0)
+        self.width_spin.setSingleStep(0.5)
+        self.width_spin.setValue(float(line_width))
+        form.addRow("Line width:", self.width_spin)
+
+        # Line colors table
+        self.colors_tbl = QtWidgets.QTableWidget(len(colors), 2)
+        self.colors_tbl.setHorizontalHeaderLabels(["Preview", "RGB"])
+        self.colors_tbl.verticalHeader().setVisible(False)
+        self.colors_tbl.horizontalHeader().setStretchLastSection(True)
+        for r, c in enumerate(colors):
+            self._set_color_row(r, c)
+
+        btns_line = QtWidgets.QHBoxLayout()
+        self.add_color_btn = QtWidgets.QPushButton("Add")
+        self.edit_color_btn = QtWidgets.QPushButton("Edit…")
+        self.remove_color_btn = QtWidgets.QPushButton("Remove")
+        btns_line.addWidget(self.add_color_btn)
+        btns_line.addWidget(self.edit_color_btn)
+        btns_line.addWidget(self.remove_color_btn)
+
+        layout.addWidget(QtWidgets.QLabel("Line colors:"))
+        layout.addWidget(self.colors_tbl)
+        layout.addLayout(btns_line)
+
+        # Dialog buttons
+        btn_box = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
+        )
+        layout.addWidget(btn_box)
+        btn_box.accepted.connect(self.accept)
+        btn_box.rejected.connect(self.reject)
+
+        # Wire up color controls
+        self.add_color_btn.clicked.connect(self._on_add_color)
+        self.edit_color_btn.clicked.connect(self._on_edit_color)
+        self.remove_color_btn.clicked.connect(self._on_remove_color)
+
+    def _set_color_row(self, row, rgb_tuple):
+        r, g, b = [int(x) for x in rgb_tuple]
+        # Preview cell
+        preview = QtWidgets.QLabel()
+        preview.setAutoFillBackground(True)
+        pal = preview.palette()
+        pal.setColor(preview.backgroundRole(), QtGui.QColor(r, g, b))
+        preview.setPalette(pal)
+        preview.setMinimumHeight(18)
+        preview.setFrameShape(QtWidgets.QFrame.Panel)
+        preview.setFrameShadow(QtWidgets.QFrame.Sunken)
+        self.colors_tbl.setCellWidget(row, 0, preview)
+        # RGB text
+        item = QtWidgets.QTableWidgetItem(f"({r}, {g}, {b})")
+        item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+        self.colors_tbl.setItem(row, 1, item)
+
+    def _on_add_color(self):
+        col = QtWidgets.QColorDialog.getColor(QtGui.QColor(0, 0, 0), self, "Pick color")
+        if not col.isValid():
+            return
+        row = self.colors_tbl.rowCount()
+        self.colors_tbl.insertRow(row)
+        self._set_color_row(row, (col.red(), col.green(), col.blue()))
+
+    def _on_edit_color(self):
+        row = self.colors_tbl.currentRow()
+        if row < 0:
+            return
+        cur = self._row_rgb(row)
+        col = QtWidgets.QColorDialog.getColor(QtGui.QColor(*cur), self, "Pick color")
+        if not col.isValid():
+            return
+        self._set_color_row(row, (col.red(), col.green(), col.blue()))
+
+    def _on_remove_color(self):
+        row = self.colors_tbl.currentRow()
+        if row >= 0:
+            self.colors_tbl.removeRow(row)
+
+    def _row_rgb(self, row):
+        text = self.colors_tbl.item(row, 1).text()
+        nums = text.strip("() ").split(",")
+        return tuple(int(float(x)) for x in nums)
+
+    def values(self):
+        # Collect settings
+        default_baud = int(self.baud_cb.currentText())
+        target_hz = int(self.hz_spin.value())
+        y_min = float(self.ymin_spin.value())
+        y_max = float(self.ymax_spin.value())
+        max_points_val = int(self.max_points_spin.value())
+        max_points = None if max_points_val == 0 else max_points_val
+        line_width = float(self.width_spin.value())
+
+        # Colors
+        colors = []
+        for row in range(self.colors_tbl.rowCount()):
+            colors.append(self._row_rgb(row))
+
+        return {
+            "default_baud": default_baud,
+            "target_hz": target_hz,
+            "y_limits": (y_min, y_max),
+            "max_points_per_channel": max_points,
+            "line_width": line_width,
+            "line_colors": colors,
+        }
+
