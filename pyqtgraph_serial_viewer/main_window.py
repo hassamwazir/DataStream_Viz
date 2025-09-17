@@ -508,7 +508,13 @@ class MultiPlot(QtWidgets.QMainWindow):
         y_sel = float(y_at[ch])
 
         # Toggle: if a pick already near this (x_sel,y_sel), remove it
-        dt_tol = 0.02  # 20 ms
+        # Get the current x-axis range (min_x, max_x)
+        # Get the ViewBox of the plot
+        vb = self.plot.plotItem.vb
+        x_range = vb.viewRange()[0]
+        # make dt_tol change with x-range
+
+        dt_tol = 0.1 * (x_range[1] - x_range[0])  # 10% of x-range
         dy_tol = (self.y_limit[1] - self.y_limit[0]) * 0.02  # 2% of Y range
 
         for k, p in enumerate(self.picks):
