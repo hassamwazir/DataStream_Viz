@@ -53,7 +53,7 @@ class MultiPlot(QtWidgets.QMainWindow):
         self.plot = pg.PlotWidget()
         self.plot.showGrid(x=True, y=True, alpha=0.25)
         self.plot.addLegend()
-        self.plot.setLabel("bottom", "Elapsed (s)")
+        self.plot.setLabel("bottom", "Time Elapsed (s)")
         self.plot.setLabel("left", "Value")
         self.plot.setYRange(*self.y_limit)
         vbox.addWidget(self.plot, 1)
@@ -143,9 +143,6 @@ class MultiPlot(QtWidgets.QMainWindow):
         QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_P), self, activated=self._toggle_pause)
         QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_C), self, activated=self._clear_buffers)
 
-        # QtWidgets.QShortcut(QtCore.Qt.Key_P, self, activated=self._toggle_pause)
-        # QtWidgets.QShortcut(QtCore.Qt.Key_C, self, activated=self._clear_buffers)
-
         # --- Timer for UI redraws ---
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self._redraw)
@@ -203,8 +200,10 @@ class MultiPlot(QtWidgets.QMainWindow):
             self.stop_reader()
 
     def start_reader(self, device, baud):
-        # self.reset_plot_buffers()
-        self._clear_buffers()
+        self.reset_plot_buffers()              # wipes curves, ring, num_ch, picks, etc.
+        self.log_q = queue.Queue(maxsize=10_000)  # fresh queue for this session
+        self.logger = None                     # force new CsvWriter on first sample
+
         self.reader = SerialReader(device, baud)
         self.reader.sample.connect(self._on_sample)
         self.reader.status.connect(self._on_status)
