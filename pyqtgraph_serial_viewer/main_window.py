@@ -259,8 +259,19 @@ class MultiPlot(QtWidgets.QMainWindow):
         if self.paused:
             return
 
+        # Need at least timestamp + 1 channel
+        if vals.size < 2:
+            return
+
+        # ESP32: millis() in first column → convert to seconds
+        ts_ms = float(vals[0])
+        ts_sec = ts_ms / 1000.0
+
+        ch_vals = vals[1:]          # ch1..chN
+
+        # --- First sample: setup channels, curves, logger ---
         if self.num_ch is None:
-            self.num_ch = int(vals.size)
+            self.num_ch = int(ch_vals.size)   # channels only (exclude timestamp)
             cap = self.max_points_per_channel or 72_000
             self.ring = Ring2D(self.num_ch, cap, dtype=np.float32)
 
@@ -276,7 +287,10 @@ class MultiPlot(QtWidgets.QMainWindow):
             for i in range(self.num_ch):
                 name = f"ch{i+1}"
                 color = colors[i % len(colors)]
-                curve = self.plot.plot(pen=pg.mkPen(color=color, width=self.line_width), name=name)
+                curve = self.plot.plot(
+                    pen=pg.mkPen(color=color, width=self.line_width),
+                    name=name,
+                )
                 curve.setClipToView(True)
                 try:
                     curve.setDownsampling(method="peak")    # newer pyqtgraph
@@ -290,24 +304,30 @@ class MultiPlot(QtWidgets.QMainWindow):
             self._on_status(f"Detected {self.num_ch} channel(s)")
 
             # Start CSV logger now that we know channel count
+            # NOTE: timestamp is now in SECONDS (float)
             header = ["timestamp"] + [f"ch{i+1}" for i in range(self.num_ch)]
             self.logger = CsvWriter(self.log_q, rotate_minutes=60, header=header)
             self.logger.start()
 
-        # Append new values with a timestamp and log using the SAME timestamp
-        n = min(self.num_ch, vals.size)
-        t = time.time()
+        # Use device time in SECONDS as time base
         if getattr(self, "t0", None) is None:
-            self.t0 = t  # first-sample origin for elapsed-time x-axis
+            self.t0 = ts_sec  # first timestamp (seconds) as origin
 
-        self.ring.append(vals[:n], t=t)
+        n = min(self.num_ch, ch_vals.size)
+        if n <= 0:
+            return
 
-        # Enqueue for logging
+        # Store SECONDS in ring
+        self.ring.append(ch_vals[:n], t=ts_sec)
+
+        # Enqueue for logging: timestamp (seconds) + channels
         try:
-            self.log_q.put_nowait((t, *vals[:n].tolist()))
+            self.log_q.put_nowait((ts_sec, *ch_vals[:n].tolist()))
         except queue.Full:
             # Optional: track drops if you care
             pass
+
+
 
 
     def _redraw(self):
@@ -320,7 +340,7 @@ class MultiPlot(QtWidgets.QMainWindow):
         if length == 0:
             return
 
-        # Elapsed seconds since start
+        # Device timestamps are in ms; convert to elapsed seconds
         x = t - self.t0
 
         # Optional coarse decimation on very large histories
@@ -357,6 +377,7 @@ class MultiPlot(QtWidgets.QMainWindow):
                 f"{'Connected' if self.connected else 'Idle'} | "
                 f"{self.num_ch or 0} ch | {length} samples | P=Pause, C=Clear"
             )
+
 
 
     # ---------- Helpers ----------

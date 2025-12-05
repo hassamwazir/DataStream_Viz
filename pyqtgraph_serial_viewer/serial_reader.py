@@ -1,29 +1,23 @@
-# serial_reader.py
 import time
 from typing import Optional
 import numpy as np
 import serial
-# from PyQt5.QtCore import pyqtSignal, QThread, QObject
 from PySide6.QtCore import Signal, QThread, QObject
 
 # ---- Tunables ----
-REQUEST_BYTE = b"1"        # change to b"1\n" or b"1\r\n" if your device expects newline/CR
-REQUEST_TIMEOUT_S = 0.300  # resend if no reply within this time
-REQUEST_MAX_RETRIES = 3    # retries before a short backoff
-REQUEST_BACKOFF_S = 0.500  # pause after hitting max retries
+START_STREAM_BYTE = b"1"   # command to start streaming on the device
+STOP_STREAM_BYTE  = b"0"   # command to stop streaming on the device
 
 
 class SerialReader(QThread):
     """
     Reads newline-delimited, space-separated numeric samples from a serial port.
-    - Sends one request byte per sample ("request-on-receive").
+
+    - On connect: sends a single 'start' command (START_STREAM_BYTE) to the device.
+    - The device then streams samples continuously: "t ch1 ch2 ch3 ..."
     - Emits a numpy array for each complete, parsed line.
-    - Has a watchdog to recover from dropped/missing responses.
+    - On stop/cleanup: sends a single 'stop' command (STOP_STREAM_BYTE).
     """
-    # sample = pyqtSignal(np.ndarray)
-    # status = pyqtSignal(str)
-    # connected = pyqtSignal()
-    # disconnected = pyqtSignal()
 
     sample = Signal(np.ndarray)
     status = Signal(str)
@@ -38,37 +32,28 @@ class SerialReader(QThread):
         self.ser: Optional[serial.Serial] = None
         self._buf = bytearray()
 
-        # request-on-receive state
-        self._awaiting_reply = False
-        self._last_request_t = 0.0
-        self._retry_count = 0
-
     # ---------- helpers ----------
-    def _send_request(self):
+    def _send_start(self):
+        """Tell the device to start streaming."""
+        if not self.ser:
+            return
         try:
-            self.ser.write(REQUEST_BYTE)
-            self._last_request_t = time.perf_counter()
-            self._awaiting_reply = True
-            # self.status.emit("→ requested sample")  # noisy; uncomment if useful
+            self.ser.write(START_STREAM_BYTE)
+            # self.status.emit("→ sent START command")
         except Exception as e:
-            self.status.emit(f"Serial write error: {e}")
+            self.status.emit(f"Serial write error (start): {e}")
 
-    def _watchdog(self, now: float):
-        """If waiting for a reply and it's late, retry with limited backoff."""
-        if not self._awaiting_reply:
+    def _send_stop(self):
+        """Tell the device to stop streaming."""
+        if not self.ser:
             return
-        if now - self._last_request_t < REQUEST_TIMEOUT_S:
-            return
-
-        if self._retry_count < REQUEST_MAX_RETRIES:
-            self._retry_count += 1
-            self.status.emit(f"Watchdog retry {self._retry_count}/{REQUEST_MAX_RETRIES}")
-            self._send_request()
-        else:
-            self.status.emit("Max retries hit; backing off…")
-            time.sleep(REQUEST_BACKOFF_S)
-            self._retry_count = 0
-            self._send_request()
+        try:
+            self.ser.write(STOP_STREAM_BYTE)
+            # small delay to let the command flush out
+            self.ser.flush()
+            # self.status.emit("→ sent STOP command")
+        except Exception as e:
+            self.status.emit(f"Serial write error (stop): {e}")
 
     # ---------- thread ----------
     def run(self):
@@ -80,12 +65,10 @@ class SerialReader(QThread):
             self.status.emit(f"ERROR opening {self.port_name}: {e}")
             return
 
-        # Kick the first request
-        self._send_request()
+        # Send one-time start command to begin continuous streaming
+        self._send_start()
 
         while not self._stop:
-            now = time.perf_counter()
-
             # Read any available bytes
             try:
                 data = self.ser.read(4096)
@@ -98,40 +81,37 @@ class SerialReader(QThread):
                         line = raw.strip().replace(b"\r", b"")
                         if not line:
                             continue
+
                         parts = line.split()
                         try:
                             vals = np.array([float(p) for p in parts], dtype=float)
                         except ValueError:
-                            # malformed; request another sample and continue
-                            self.status.emit("Parse error; re-requesting…")
-                            self._send_request()
+                            # malformed; skip
+                            self.status.emit("Parse error; skipping line…")
                             continue
 
                         if vals.size > 0:
-                            # Got a valid sample: clear awaiting flag and emit
-                            self._awaiting_reply = False
-                            self._retry_count = 0
+                            # Emit the parsed sample (t, ch1, ch2, ...)
                             self.sample.emit(vals)
-
-                            # Immediately request next sample
-                            self._send_request()
                 else:
                     self.msleep(1)  # avoid busy-wait
             except Exception as e:
                 self.status.emit(f"Serial read error: {e}")
                 self.msleep(50)
 
-            # Watchdog for late/missing replies
-            self._watchdog(now)
-
         # Cleanup
         try:
             if self.ser and self.ser.is_open:
+                # Tell device to stop streaming before closing
+                self._send_stop()
+                time.sleep(0.05)
                 self.ser.close()
                 self.status.emit("Serial port closed")
         except Exception:
             pass
+
         self.disconnected.emit()
 
     def stop(self):
+        """Request the reader thread to stop and (in run) send '0' before closing."""
         self._stop = True
